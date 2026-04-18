@@ -8,8 +8,8 @@ def build_main_window():
     window.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
     window.configure(bg="#111111")
 
-    status_text = tk.StingVar(value="Status: Not started")
-    debug_text = tk.StingVar(value="Debug: Waiting to start")
+    status_text = tk.StringVar(value="Status: Not started")
+    debug_text = tk.StringVar(value="Debug: Waiting to start")
 
     title_label = tk.Label(
         window,
@@ -31,14 +31,12 @@ def build_main_window():
 
     debug_label = tk.Label(
         window,
-        textvariable=debug_text, 
-        font=("Arial", 14),
-        width=60,
-        height=20,
-        bg="black",
-        fg="white"
+        textvariable=debug_text,
+        font=("Arial", 11),
+        bg="#111111",
+        fg="#bbbbbb"
     )
-    debug_label.pack(pady=(0,12))
+    debug_label.pack(pady=(0, 12))
 
     preview_label = tk.Label(
         window, 
@@ -54,17 +52,17 @@ def build_main_window():
     button_frame = tk.Frame(window, bg="#111111")
     button_frame.pack(pady=12)
 
-    start_button = tk.button(
+    start_button = tk.Button(
         button_frame,
         text="Start Monitoring",
         font=("Arial", 12, "bold"),
         width=18
     )
-    start_button.pack(slide="left", padx=10)
+    start_button.pack(side="left", padx=10)
 
     stop_button = tk.Button(
         button_frame,
-        text="Stop Monitory",
+        text="Stop Monitoring",
         font=("Arial", 12, "bold"),
         width=18
     )
