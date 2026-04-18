@@ -1,7 +1,9 @@
-import tkinter as tk # GUI
+from ui import build_main_window # imports from ui.py
 
-window = tk.Tk() # creates the main window
-window.title("Focus Intervention System") # title of the window
-window.geometry("900x720") # size of the window
+ui = build_main_window() # assigns the function from ui to this 
+window = ui["window"] # pulls the main Tkinter window out of the dictionary
 
-window.mainloop() # keeps the window on
+status_text = ui["status_text"]
+
+
+window.mainloop() # keeps the window running
