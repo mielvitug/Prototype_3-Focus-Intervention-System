@@ -2,6 +2,8 @@
 
 A Python desktop app that monitors a live webcam feed, looks for attention loss or possible phone usage, and responds with a forced video interruption.
 
+At its core, this system is a focus-monitoring experiment built out of computer vision, shitposting, and memeing.
+
 ## What It Does
 
 - opens your webcam and shows a live preview
