@@ -1,39 +1,60 @@
-from pathlib import Path #helps build file paths directory
+from pathlib import Path
 
 try:
-    import cv2 # cv2 talks to the cam and reads video frames
-except ImportError: # catches if there is no import module used
-    cv2 = None # if it catches, it then sets this cv2 to None
+    import cv2
+except ImportError:
+    cv2 = None
 
-# try:
-#     from PIL import Image, ImageTk # PIL (Python Imaging Library) is for images
-# except ImportError: # catches if there is no import module used
-#     image = None
-#     ImageTk = None
 
-BASE_DIR = Path(__file__).resolve().parent # Get the folder that this Python file is inside, and store it
+BASE_DIR = Path(__file__).resolve().parent
+DATASET_DIR = BASE_DIR / "dataset"
+MODELS_DIR = BASE_DIR / "models"
 
-CAMERA_INDEX = 0 # Default camera
-MEME_VIDEO_PATH = BASE_DIR / "meme_video.mp4"
+CAMERA_INDEX = 0
+CAMERA_FRAME_WIDTH = 1280
+CAMERA_FRAME_HEIGHT = 720
+CAMERA_TARGET_FPS = 30
+MEME_VIDEO_DIR = BASE_DIR / "meme_videos"
 FACE_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml" if cv2 else None
-# Use OpenCV’s built-in folder of detector files, and choose the frontal-face detector XML
 
-ATTENTION_STREAK_SECOND = 4.0 # if no face detected = play meme video
-COOLDOWN_SECONDS = 8.0 # cooldown after the meme video triggers
-FRAME_INTERVAL_MS = 80 # update webcame every 80 miliseconds.
- 
-WINDOW_WIDTH = 900 # window size
-WINDOW_HEIGHT = 720
+ATTENTION_STREAK_SECONDS = 4.0
+PHONE_USAGE_STREAK_SECONDS = 2.0
+COOLDOWN_SECONDS = 3.0
+FRAME_INTERVAL_MS = 33
+INTERVENTION_FRAME_INTERVAL_MS = 50
+ANALYSIS_INTERVAL_MS = 120
+ANALYSIS_FRAME_WIDTH = 960
+ANALYSIS_FRAME_HEIGHT = 540
+VIDEO_STOP_ON_FACE_RETURN_SECONDS = 1.0
+VIDEO_EXTRA_PLAY_SECONDS_ON_FACE_RETURN = 1.0
 
-PREVIEW_MAX_WIDTH = 720 # size of the camera inside the window
-PREVIEW_MAX_HEIGHT = 405
+WINDOW_WIDTH = 1460
+WINDOW_HEIGHT = 1060
 
-VIDEO_POPUP_MAX_WIDTH = 960 # maximum size of the video 
-VIDEO_POPUP_MAX_HEIGHT = 540 
+PREVIEW_MAX_WIDTH = 1280
+PREVIEW_MAX_HEIGHT = 720
 
-MIN_FACE_SIZE = (80, 80) # ignore anything other than 80x80p when looking for a face
-FACE_SCALE_FACTOR = 1.1 # searches for faces of various sizes
-FACE_MIN_NEIGHBORS = 5 # controls how sure OPENCV should check a face low=more detections but false-pos, high = least 5 supporting detections before accepting
+VIDEO_POPUP_MAX_WIDTH = 960
+VIDEO_POPUP_MAX_HEIGHT = 540
 
-USE_MIRRORED_PREVIEW = True # webcam mirror view like, flips it
-VIDEO_FALLBACK_DELAY_MS = 33 # backup speed for playing the meme video, hence 30 fps
+MIN_FACE_SIZE = (80, 80)
+FACE_SCALE_FACTOR = 1.1
+FACE_MIN_NEIGHBORS = 5
+FACE_FALLBACK_MIN_SIZE = (60, 60)
+FACE_FALLBACK_MIN_NEIGHBORS = 3
+FACE_MISS_CONFIRM_FRAMES = 8
+FACE_DETECTION_GRACE_SECONDS = 2.0
+
+USE_MIRRORED_PREVIEW = True
+VIDEO_FALLBACK_DELAY_MS = 33
+SUPPORTED_VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+
+PHONE_USAGE_IMAGE_SIZE = (32, 32)
+PHONE_USAGE_THRESHOLD = 0.50
+PHONE_USAGE_MIN_FACE_STABLE_SECONDS = 0.8
+PHONE_DETECT_CONFIRM_FRAMES = 2
+PHONE_USAGE_STRONG_MARGIN = 0.03
+PHONE_SCORE_TRIGGER = 999.0
+PHONE_SCORE_GAIN_PER_SECOND = 1.0
+PHONE_SCORE_DECAY_PER_SECOND = 1.2
+PHONE_USAGE_MODEL_PATH = MODELS_DIR / "phone_usage_model.npz"

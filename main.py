@@ -1,12 +1,43 @@
+import threading
 import time
+from pathlib import Path
 
-from ui import build_main_window # imports from ui.py
-from camera import open_camera, close_camera, get_preview_image, read_frame
-from detection import load_face_detector, has_face
-from config import FRAME_INTERVAL_MS, ATTENTION_STREAK_SECONDS
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
-ui = build_main_window() # assigns the function from ui to this 
-window = ui["window"] # pulls the main Tkinter window out of the dictionary
+from camera import close_camera, get_preview_image_from_frame, open_camera, read_frame
+from config import (
+    ANALYSIS_FRAME_HEIGHT,
+    ANALYSIS_FRAME_WIDTH,
+    ANALYSIS_INTERVAL_MS,
+    ATTENTION_STREAK_SECONDS,
+    COOLDOWN_SECONDS,
+    FACE_DETECTION_GRACE_SECONDS,
+    FACE_MISS_CONFIRM_FRAMES,
+    FRAME_INTERVAL_MS,
+    INTERVENTION_FRAME_INTERVAL_MS,
+    PHONE_DETECT_CONFIRM_FRAMES,
+    PHONE_USAGE_MODEL_PATH,
+    PHONE_USAGE_MIN_FACE_STABLE_SECONDS,
+    PHONE_USAGE_STRONG_MARGIN,
+    PHONE_SCORE_DECAY_PER_SECOND,
+    PHONE_SCORE_GAIN_PER_SECOND,
+    PHONE_SCORE_TRIGGER,
+    PHONE_USAGE_STREAK_SECONDS,
+    PHONE_USAGE_THRESHOLD,
+    VIDEO_EXTRA_PLAY_SECONDS_ON_FACE_RETURN,
+    VIDEO_STOP_ON_FACE_RETURN_SECONDS,
+)
+from detection import annotate_faces, detect_faces, load_face_detector
+from phone_usage_model import PhoneUsageModel
+from ui import build_main_window
+from video_popup import VideoPopup
+
+
+ui = build_main_window()
+window = ui["window"]
 
 status_text = ui["status_text"]
 debug_text = ui["debug_text"]
@@ -19,102 +50,633 @@ camera = None
 preview_job = None
 face_detector = None
 distraction_start_time = None
+phone_usage_start_time = None
+phone_usage_score = 0.0
+phone_detect_confirm_count = 0
+face_present_start_time = 0.0
+last_face_seen_at = 0.0
+missed_face_frames = 0
+face_return_start_time = 0.0
+cooldown_until = 0.0
+intervention_active = False
+video_popup = VideoPopup(window)
+phone_usage_model = None
+next_analysis_at = 0.0
+last_analysis_at = 0.0
+cached_faces = ()
+cached_face_found = False
+cached_phone_probability = None
+phone_probability_ema = 0.0
+analysis_lock = threading.Lock()
+analysis_in_flight = False
+analysis_result_version = 0
+last_consumed_analysis_version = 0
+pending_analysis_error = None
+analysis_session_id = 0
+
+
+def refresh_controls():
+    if intervention_active:
+        start_button.config(state="disabled")
+        stop_button.config(state="normal")
+    elif is_monitoring:
+        start_button.config(state="disabled")
+        stop_button.config(state="normal")
+    else:
+        start_button.config(state="normal")
+        stop_button.config(state="disabled")
+
+
+def schedule_preview(delay_ms=FRAME_INTERVAL_MS):
+    global preview_job
+
+    preview_job = window.after(max(1, int(delay_ms)), update_preview)
+
+
+def schedule_next_preview(loop_started_at, target_interval_ms=FRAME_INTERVAL_MS):
+    elapsed_ms = (time.perf_counter() - loop_started_at) * 1000.0
+    remaining_ms = max(1, int(round(target_interval_ms - elapsed_ms)))
+    schedule_preview(remaining_ms)
+
+
+def _prepare_analysis_frame(frame):
+    if cv2 is None:
+        return frame.copy(), frame.shape[:2], frame.shape[:2]
+
+    frame_height, frame_width = frame.shape[:2]
+    scale = min(
+        ANALYSIS_FRAME_WIDTH / max(frame_width, 1),
+        ANALYSIS_FRAME_HEIGHT / max(frame_height, 1),
+        1.0,
+    )
+
+    if scale >= 0.999:
+        return frame.copy(), frame.shape[:2], frame.shape[:2]
+
+    resized_width = max(1, int(round(frame_width * scale)))
+    resized_height = max(1, int(round(frame_height * scale)))
+    resized_frame = cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+    return resized_frame, (frame_height, frame_width), (resized_height, resized_width)
+
+
+def _scale_faces_to_frame(faces, source_shape, target_shape):
+    source_height, source_width = source_shape
+    target_height, target_width = target_shape
+
+    if source_height == target_height and source_width == target_width:
+        return tuple(tuple(int(value) for value in face) for face in faces)
+
+    scale_x = target_width / max(source_width, 1)
+    scale_y = target_height / max(source_height, 1)
+    scaled_faces = []
+
+    for x, y, width, height in faces:
+        scaled_faces.append(
+            (
+                int(round(x * scale_x)),
+                int(round(y * scale_y)),
+                int(round(width * scale_x)),
+                int(round(height * scale_y)),
+            )
+        )
+
+    return tuple(scaled_faces)
+
+
+def _run_frame_analysis(frame, analyzed_at, session_id):
+    global analysis_in_flight, analysis_result_version, cached_faces, cached_face_found, cached_phone_probability
+    global last_analysis_at, phone_probability_ema, pending_analysis_error
+
+    try:
+        analysis_frame, original_shape, analysis_shape = _prepare_analysis_frame(frame)
+        detector = face_detector
+        model = phone_usage_model
+
+        faces, detect_error = detect_faces(analysis_frame, detector)
+        if detect_error is not None:
+            with analysis_lock:
+                if session_id == analysis_session_id and is_monitoring:
+                    pending_analysis_error = detect_error
+                analysis_in_flight = False
+            return
+
+        scaled_faces = _scale_faces_to_frame(faces, analysis_shape, original_shape)
+        phone_probability = None
+
+        if model is not None and scaled_faces:
+            phone_probability = model.predict_frame_probability(frame, faces=scaled_faces)
+
+        with analysis_lock:
+            if session_id != analysis_session_id or not is_monitoring:
+                analysis_in_flight = False
+                return
+
+            cached_faces = scaled_faces
+            cached_face_found = len(cached_faces) > 0
+            cached_phone_probability = phone_probability
+            phone_probability_ema = (phone_probability_ema * 0.65) + ((phone_probability or 0.0) * 0.35)
+            last_analysis_at = analyzed_at
+            analysis_result_version += 1
+            analysis_in_flight = False
+    except Exception as exc:
+        with analysis_lock:
+            if session_id == analysis_session_id and is_monitoring:
+                pending_analysis_error = f"Background analysis crashed: {exc}"
+            analysis_in_flight = False
+
+
+def queue_frame_analysis(frame, now):
+    global analysis_in_flight, next_analysis_at, pending_analysis_error
+
+    with analysis_lock:
+        if analysis_in_flight:
+            return False
+
+        analysis_in_flight = True
+        next_analysis_at = now + (ANALYSIS_INTERVAL_MS / 1000.0)
+        pending_analysis_error = None
+        session_id = analysis_session_id
+
+    worker = threading.Thread(
+        target=_run_frame_analysis,
+        args=(frame.copy(), now, session_id),
+        daemon=True,
+    )
+    worker.start()
+    return True
+
+
+def get_analysis_snapshot():
+    with analysis_lock:
+        return {
+            "error": pending_analysis_error,
+            "version": analysis_result_version,
+            "faces": tuple(cached_faces),
+            "face_found": cached_face_found,
+            "phone_probability": cached_phone_probability,
+            "phone_probability_ema": phone_probability_ema,
+            "last_analysis_at": last_analysis_at,
+            "next_analysis_at": next_analysis_at,
+            "analysis_in_flight": analysis_in_flight,
+        }
+
+
+def set_error_state(message):
+    status_text.set("Status: Error")
+    debug_text.set(f"Debug: {message}")
+
+
+def fail_monitoring(message):
+    global is_monitoring, camera, preview_job, face_detector, distraction_start_time, phone_usage_start_time
+    global cooldown_until, intervention_active, phone_usage_model, last_face_seen_at, missed_face_frames, face_present_start_time, face_return_start_time, phone_usage_score, phone_detect_confirm_count
+    global next_analysis_at, last_analysis_at, cached_faces, cached_face_found, cached_phone_probability, phone_probability_ema
+    global analysis_in_flight, analysis_result_version, last_consumed_analysis_version, pending_analysis_error, analysis_session_id
+
+    if preview_job is not None:
+        window.after_cancel(preview_job)
+        preview_job = None
+
+    video_popup.close(notify=False)
+    close_camera(camera)
+
+    camera = None
+    face_detector = None
+    distraction_start_time = None
+    phone_usage_start_time = None
+    phone_usage_score = 0.0
+    phone_detect_confirm_count = 0
+    face_present_start_time = 0.0
+    face_return_start_time = 0.0
+    last_face_seen_at = 0.0
+    missed_face_frames = 0
+    cooldown_until = 0.0
+    intervention_active = False
+    phone_usage_model = None
+    is_monitoring = False
+    next_analysis_at = 0.0
+    last_analysis_at = 0.0
+    cached_faces = ()
+    cached_face_found = False
+    cached_phone_probability = None
+    phone_probability_ema = 0.0
+    analysis_in_flight = False
+    analysis_result_version = 0
+    last_consumed_analysis_version = 0
+    pending_analysis_error = None
+    analysis_session_id += 1
+
+    preview_label.config(image="", text="Camera preview stopped")
+    preview_label.image = None
+    refresh_controls()
+    set_error_state(message)
+
+
+def load_phone_usage_model():
+    if not PHONE_USAGE_MODEL_PATH.exists():
+        return None
+
+    try:
+        return PhoneUsageModel.load(PHONE_USAGE_MODEL_PATH)
+    except Exception:
+        return None
+
+
+def handle_video_finished():
+    global intervention_active, cooldown_until, distraction_start_time, phone_usage_start_time, preview_job, last_face_seen_at, missed_face_frames, face_present_start_time, face_return_start_time, phone_usage_score, phone_detect_confirm_count
+    global next_analysis_at, last_analysis_at, phone_probability_ema, last_consumed_analysis_version
+
+    intervention_active = False
+    distraction_start_time = None
+    phone_usage_start_time = None
+    phone_usage_score = 0.0
+    phone_detect_confirm_count = 0
+    face_present_start_time = time.time()
+    face_return_start_time = 0.0
+    last_face_seen_at = time.time()
+    missed_face_frames = 0
+    next_analysis_at = 0.0
+    last_analysis_at = 0.0
+    phone_probability_ema = 0.0
+    last_consumed_analysis_version = analysis_result_version
+    refresh_controls()
+
+    if not is_monitoring:
+        return
+
+    cooldown_until = time.time() + COOLDOWN_SECONDS
+    status_text.set("Status: Cooldown")
+    debug_text.set(f"Debug: Cooldown for {COOLDOWN_SECONDS:.1f}s")
+
+    if preview_job is None:
+        schedule_preview()
+
+
+def trigger_intervention(reason="attention"):
+    global intervention_active, preview_job, distraction_start_time, phone_usage_start_time, missed_face_frames, face_return_start_time, phone_usage_score, phone_detect_confirm_count
+    global phone_probability_ema
+
+    if intervention_active or not is_monitoring:
+        return
+
+    intervention_active = True
+    distraction_start_time = None
+    phone_usage_start_time = None
+    phone_usage_score = 0.0
+    phone_detect_confirm_count = 0
+    missed_face_frames = 0
+    face_return_start_time = 0.0
+    phone_probability_ema = 0.0
+    refresh_controls()
+
+    if reason == "phone":
+        status_text.set("Status: Intervention (Phone)")
+    else:
+        status_text.set("Status: Intervention (Attention)")
+
+    popup_error = video_popup.play(on_complete=handle_video_finished)
+
+    if popup_error is not None:
+        intervention_active = False
+        refresh_controls()
+        set_error_state(popup_error)
+        schedule_preview()
+        return
+
+    if video_popup.current_video_path is not None:
+        debug_text.set(f"Debug: {reason} trigger | Playing {Path(video_popup.current_video_path).name}")
+    else:
+        debug_text.set(f"Debug: {reason} trigger | Playing meme video")
+
+    if preview_job is None:
+        schedule_preview()
+
+
+def analyze_current_frame(frame, now):
+    return queue_frame_analysis(frame, now)
+
 
 def update_preview():
-    global preview_job, distraction_start_time
+    global preview_job, distraction_start_time, phone_usage_start_time, last_face_seen_at, missed_face_frames, face_present_start_time, face_return_start_time, phone_usage_score, phone_detect_confirm_count
+    global next_analysis_at, last_analysis_at, cached_faces, cached_face_found, cached_phone_probability, phone_probability_ema
+    global last_consumed_analysis_version
+
+    preview_job = None
+    loop_started_at = time.perf_counter()
 
     if not is_monitoring or camera is None:
-        preview_job = None
         return
 
     frame, frame_error = read_frame(camera)
 
     if frame_error is not None:
-        status_text.set("Status: Error")
-        debug_text.set(f"Debug: {frame_error}")
-        preview_job = None
+        fail_monitoring(frame_error)
         return
 
-    face_found, detect_error = has_face(frame, face_detector)
+    now = time.time()
+    snapshot = get_analysis_snapshot()
 
-    if detect_error is not None:
-        status_text.set("Status: Error")
-        debug_text.set(f"Debug: {detect_error}")
-        preview_job = None
+    if snapshot["error"] is not None:
+        fail_monitoring(snapshot["error"])
         return
 
-    preview_image, preview_error = get_preview_image(camera)
+    should_queue_analysis = (
+        (snapshot["next_analysis_at"] == 0.0 or now >= snapshot["next_analysis_at"])
+        and not snapshot["analysis_in_flight"]
+    )
+    if should_queue_analysis:
+        analyze_current_frame(frame, now)
+        snapshot = get_analysis_snapshot()
 
-    if preview_error is not None:
-        status_text.set("Status: Error")
-        debug_text.set(f"Debug: {preview_error}")
-        preview_job = None
+    analysis_updated = snapshot["version"] != last_consumed_analysis_version
+    if analysis_updated:
+        last_consumed_analysis_version = snapshot["version"]
+
+    face_found = snapshot["face_found"]
+    faces = snapshot["faces"]
+    phone_probability = snapshot["phone_probability"]
+    phone_probability_ema_local = snapshot["phone_probability_ema"]
+    last_analysis_at_local = snapshot["last_analysis_at"]
+
+    if not intervention_active:
+        annotated_frame = annotate_faces(frame, faces)
+        preview_image, preview_error = get_preview_image_from_frame(annotated_frame)
+
+        if preview_error is not None:
+            fail_monitoring(preview_error)
+            return
+
+        preview_label.config(image=preview_image, text="")
+        preview_label.image = preview_image
+
+    if intervention_active:
+        if face_found:
+            phone_threshold = None
+            strong_phone_threshold = None
+            effective_phone_probability = phone_probability_ema_local
+            total_face_return_stop_seconds = (
+                VIDEO_STOP_ON_FACE_RETURN_SECONDS + VIDEO_EXTRA_PLAY_SECONDS_ON_FACE_RETURN
+            )
+
+            if phone_usage_model is not None:
+                phone_threshold = max(
+                    PHONE_USAGE_THRESHOLD,
+                    getattr(phone_usage_model, "decision_threshold", PHONE_USAGE_THRESHOLD),
+                )
+                strong_phone_threshold = min(max(phone_threshold + PHONE_USAGE_STRONG_MARGIN, 0.58), 0.96)
+                if phone_probability is not None:
+                    effective_phone_probability = (phone_probability * 0.45) + (phone_probability_ema_local * 0.55)
+
+            if (
+                phone_probability is not None
+                and strong_phone_threshold is not None
+                and phone_probability >= strong_phone_threshold
+                and phone_probability_ema_local >= strong_phone_threshold
+            ):
+                face_return_start_time = 0.0
+                status_text.set("Status: Intervention (Phone)")
+                debug_text.set(
+                    f"Debug: Playing {Path(video_popup.current_video_path).name} | phone {phone_probability:.2f} | smooth {phone_probability_ema_local:.2f} | effective {effective_phone_probability:.2f}"
+                    if video_popup.current_video_path is not None
+                    else f"Debug: Playing meme video | phone {phone_probability:.2f} | smooth {phone_probability_ema_local:.2f} | effective {effective_phone_probability:.2f}"
+                )
+            else:
+                if face_return_start_time == 0.0:
+                    face_return_start_time = now
+
+                return_seconds = now - face_return_start_time
+                remaining = max(total_face_return_stop_seconds - return_seconds, 0.0)
+                status_text.set("Status: Intervention")
+
+                if phone_probability is not None and phone_threshold is not None:
+                    debug_text.set(
+                        f"Debug: Face returned | phone clear {effective_phone_probability:.2f}/{phone_threshold:.2f} | raw {phone_probability:.2f} | stopping video in {remaining:.1f}s"
+                    )
+                else:
+                    debug_text.set(f"Debug: Face returned | stopping video in {remaining:.1f}s")
+
+                if return_seconds >= total_face_return_stop_seconds:
+                    video_popup.close()
+                    return
+        else:
+            face_return_start_time = 0.0
+
+        if status_text.get() not in ("Status: Intervention (Phone)", "Status: Intervention (Attention)"):
+            status_text.set("Status: Intervention")
+        if not face_found and video_popup.current_video_path is not None:
+            debug_text.set(f"Debug: Playing {Path(video_popup.current_video_path).name}")
+        elif not face_found:
+            debug_text.set("Debug: Playing meme video")
+        schedule_next_preview(loop_started_at, INTERVENTION_FRAME_INTERVAL_MS)
         return
 
-    preview_label.config(image=preview_image, text="")
-    preview_label.image = preview_image
-
-    if face_found:
+    if now < cooldown_until:
+        remaining = cooldown_until - now
+        status_text.set("Status: Cooldown")
+        debug_text.set(f"Debug: Cooldown {remaining:.1f}s remaining")
+    elif face_found:
+        if face_present_start_time == 0.0:
+            face_present_start_time = now
+        last_face_seen_at = now
+        missed_face_frames = 0
         distraction_start_time = None
         status_text.set("Status: Monitoring")
-        debug_text.set("Debug: Face detected")
-    else:
-        if distraction_start_time is None:
-            distraction_start_time = time.time()
 
-        missing_seconds = time.time() - distraction_start_time
-        debug_text.set(f"Debug: No face detected for {missing_seconds:.1f}s")
+        if phone_usage_model is not None:
+            analysis_seconds = max(
+                now - last_analysis_at_local if last_analysis_at_local else (ANALYSIS_INTERVAL_MS / 1000.0),
+                FRAME_INTERVAL_MS / 1000.0,
+            )
+            face_stable_seconds = now - face_present_start_time
+            phone_threshold = max(
+                PHONE_USAGE_THRESHOLD,
+                getattr(phone_usage_model, "decision_threshold", PHONE_USAGE_THRESHOLD),
+            )
+            strong_phone_threshold = min(max(phone_threshold + PHONE_USAGE_STRONG_MARGIN, 0.58), 0.96)
+            phone_probability = phone_probability if phone_probability is not None else 0.0
+            effective_phone_probability = (phone_probability * 0.45) + (phone_probability_ema_local * 0.55)
 
-        if missing_seconds >= ATTENTION_STREAK_SECONDS:
-            status_text.set("Status: Distracted")
+            if face_stable_seconds < PHONE_USAGE_MIN_FACE_STABLE_SECONDS:
+                phone_usage_start_time = None
+                phone_detect_confirm_count = 0
+                if analysis_updated:
+                    phone_usage_score = max(phone_usage_score - analysis_seconds * PHONE_SCORE_DECAY_PER_SECOND, 0.0)
+                debug_text.set(
+                    f"Debug: Face detected | stabilizing {face_stable_seconds:.1f}/{PHONE_USAGE_MIN_FACE_STABLE_SECONDS:.1f}s | score {phone_usage_score:.1f}/{PHONE_SCORE_TRIGGER:.1f}"
+                )
+            elif phone_probability >= strong_phone_threshold and phone_probability_ema_local >= strong_phone_threshold:
+                if analysis_updated:
+                    phone_detect_confirm_count += 1
+
+                if phone_detect_confirm_count < PHONE_DETECT_CONFIRM_FRAMES:
+                    phone_usage_start_time = None
+                    debug_text.set(
+                        f"Debug: Possible phone raw {phone_probability:.2f} | smooth {phone_probability_ema_local:.2f} | effective {effective_phone_probability:.2f}/{strong_phone_threshold:.2f} | confirm {phone_detect_confirm_count}/{PHONE_DETECT_CONFIRM_FRAMES}"
+                    )
+                else:
+                    if phone_usage_start_time is None:
+                        phone_usage_start_time = now
+
+                    phone_seconds = now - phone_usage_start_time
+                    if analysis_updated:
+                        phone_usage_score = min(phone_usage_score + analysis_seconds * PHONE_SCORE_GAIN_PER_SECOND, PHONE_USAGE_STREAK_SECONDS)
+                    status_text.set("Status: Phone Usage")
+                    debug_text.set(
+                        f"Debug: Face detected | raw {phone_probability:.2f} | smooth {phone_probability_ema_local:.2f} | effective {effective_phone_probability:.2f}/{strong_phone_threshold:.2f} for {phone_seconds:.1f}s"
+                    )
+
+                    if phone_seconds >= PHONE_USAGE_STREAK_SECONDS:
+                        trigger_intervention(reason="phone")
+                        return
+            elif phone_probability >= max(phone_threshold - 0.05, 0.55) or phone_probability_ema_local >= max(phone_threshold - 0.05, 0.55):
+                phone_usage_start_time = None
+                if analysis_updated:
+                    phone_detect_confirm_count = 0
+                if analysis_updated:
+                    phone_usage_score = max(phone_usage_score - analysis_seconds * PHONE_SCORE_DECAY_PER_SECOND, 0.0)
+                debug_text.set(
+                    f"Debug: Suspicious phone signal raw {phone_probability:.2f} | smooth {phone_probability_ema_local:.2f} | effective {effective_phone_probability:.2f}/{phone_threshold:.2f} | not counting"
+                )
+            else:
+                phone_usage_start_time = None
+                phone_detect_confirm_count = 0
+                if analysis_updated:
+                    phone_usage_score = max(phone_usage_score - analysis_seconds * PHONE_SCORE_DECAY_PER_SECOND, 0.0)
+                debug_text.set(
+                    f"Debug: Face detected | phone score {phone_probability:.2f}/{phone_threshold:.2f} | smooth {phone_probability_ema_local:.2f} | total {phone_usage_score:.1f}/{PHONE_SCORE_TRIGGER:.1f}"
+                )
         else:
+            phone_usage_start_time = None
+            phone_detect_confirm_count = 0
+            if analysis_updated:
+                phone_usage_score = max(phone_usage_score - (ANALYSIS_INTERVAL_MS / 1000.0) * PHONE_SCORE_DECAY_PER_SECOND, 0.0)
+                phone_probability_ema = max(phone_probability_ema_local * 0.7, 0.0)
+            debug_text.set("Debug: Face detected")
+    else:
+        phone_usage_start_time = None
+        phone_detect_confirm_count = 0
+        if analysis_updated:
+            phone_usage_score = max(phone_usage_score - (ANALYSIS_INTERVAL_MS / 1000.0) * PHONE_SCORE_DECAY_PER_SECOND, 0.0)
+            phone_probability_ema = max(phone_probability_ema_local * 0.7, 0.0)
+            missed_face_frames += 1
+        recently_saw_face = last_face_seen_at > 0 and (now - last_face_seen_at) <= FACE_DETECTION_GRACE_SECONDS
+
+        if recently_saw_face or missed_face_frames < FACE_MISS_CONFIRM_FRAMES:
+            distraction_start_time = None
+            status_text.set("Status: Monitoring")
+            grace_remaining = max(FACE_DETECTION_GRACE_SECONDS - (now - last_face_seen_at), 0.0) if last_face_seen_at > 0 else 0.0
+            debug_text.set(
+                f"Debug: Face detection unstable | miss {missed_face_frames}/{FACE_MISS_CONFIRM_FRAMES} | grace {grace_remaining:.1f}s"
+            )
+        else:
+            face_present_start_time = 0.0
+            if distraction_start_time is None:
+                distraction_start_time = now
+
+            missing_seconds = now - distraction_start_time
+            debug_text.set(f"Debug: No face detected for {missing_seconds:.1f}s")
+
+            if missing_seconds >= ATTENTION_STREAK_SECONDS:
+                trigger_intervention(reason="attention")
+                return
+
             status_text.set("Status: Monitoring")
 
-    preview_job = window.after(FRAME_INTERVAL_MS, update_preview)
+    schedule_next_preview(loop_started_at)
+
 
 def start_monitoring():
-    global is_monitoring, camera, face_detector, distraction_start_time
+    global is_monitoring, camera, face_detector, distraction_start_time, phone_usage_start_time, cooldown_until, intervention_active, phone_usage_model, last_face_seen_at, missed_face_frames, face_present_start_time, face_return_start_time, phone_usage_score, phone_detect_confirm_count
+    global next_analysis_at, last_analysis_at, cached_faces, cached_face_found, cached_phone_probability, phone_probability_ema
+    global analysis_in_flight, analysis_result_version, last_consumed_analysis_version, pending_analysis_error, analysis_session_id
 
-    if is_monitoring: # guard checks, to not spam the button
+    if is_monitoring:
         return
-    
+
     detector, detector_error = load_face_detector()
 
     if detector_error is not None:
-        status_text.set("Status: Error")
-        debug_text.set(f"Debug: {detector_error}")
+        set_error_state(detector_error)
         return
-    
-    camera, camera_error = open_camera()
+
+    opened_camera, camera_error = open_camera()
 
     if camera_error is not None:
-        status_text.set("Status: Error")
-        debug_text.set(f"Debug: {camera_error}")
-        camera = None
+        set_error_state(camera_error)
         return
 
+    camera = opened_camera
     face_detector = detector
     distraction_start_time = None
+    phone_usage_start_time = None
+    phone_usage_score = 0.0
+    phone_detect_confirm_count = 0
+    face_present_start_time = 0.0
+    face_return_start_time = 0.0
+    last_face_seen_at = time.time()
+    missed_face_frames = 0
+    cooldown_until = 0.0
+    intervention_active = False
     is_monitoring = True
+    phone_usage_model = load_phone_usage_model()
+    next_analysis_at = 0.0
+    last_analysis_at = 0.0
+    cached_faces = ()
+    cached_face_found = False
+    cached_phone_probability = None
+    phone_probability_ema = 0.0
+    analysis_in_flight = False
+    analysis_result_version = 0
+    last_consumed_analysis_version = 0
+    pending_analysis_error = None
+    analysis_session_id += 1
+    refresh_controls()
+
     status_text.set("Status: Monitoring")
-    debug_text.set("Debug: Camera and detector ready")
+    if phone_usage_model is not None:
+        debug_text.set("Debug: Camera, detector, and phone model ready")
+    else:
+        debug_text.set("Debug: Camera and detector ready")
     update_preview()
 
-def stop_monitoring():
-    global is_monitoring, camera, preview_job, face_detector, distraction_start_time
 
-    if not is_monitoring:
-        return
-    
+def stop_monitoring():
+    global is_monitoring, camera, preview_job, face_detector, distraction_start_time, phone_usage_start_time, cooldown_until, intervention_active, phone_usage_model, last_face_seen_at, missed_face_frames, face_present_start_time, face_return_start_time, phone_usage_score, phone_detect_confirm_count
+    global next_analysis_at, last_analysis_at, cached_faces, cached_face_found, cached_phone_probability, phone_probability_ema
+    global analysis_in_flight, analysis_result_version, last_consumed_analysis_version, pending_analysis_error, analysis_session_id
+
     if preview_job is not None:
         window.after_cancel(preview_job)
         preview_job = None
-    
+
+    video_popup.close(notify=False)
+
     close_camera(camera)
     camera = None
     face_detector = None
     distraction_start_time = None
+    phone_usage_start_time = None
+    phone_usage_score = 0.0
+    phone_detect_confirm_count = 0
+    face_present_start_time = 0.0
+    face_return_start_time = 0.0
+    last_face_seen_at = 0.0
+    missed_face_frames = 0
+    cooldown_until = 0.0
+    intervention_active = False
+    phone_usage_model = None
     is_monitoring = False
+    next_analysis_at = 0.0
+    last_analysis_at = 0.0
+    cached_faces = ()
+    cached_face_found = False
+    cached_phone_probability = None
+    phone_probability_ema = 0.0
+    analysis_in_flight = False
+    analysis_result_version = 0
+    last_consumed_analysis_version = 0
+    pending_analysis_error = None
+    analysis_session_id += 1
+    refresh_controls()
 
     preview_label.config(image="", text="Camera preview stopped")
     preview_label.image = None
@@ -122,7 +684,15 @@ def stop_monitoring():
     status_text.set("Status: Stopped")
     debug_text.set("Debug: Camera released")
 
-start_button.config(command=start_monitoring) # places the function on the start button.
-stop_button.config(command=stop_monitoring) # places the function on the stop button
 
-window.mainloop() # keeps the window running
+def on_window_close():
+    stop_monitoring()
+    window.destroy()
+
+
+start_button.config(command=start_monitoring)
+stop_button.config(command=stop_monitoring)
+window.protocol("WM_DELETE_WINDOW", on_window_close)
+refresh_controls()
+
+window.mainloop()
